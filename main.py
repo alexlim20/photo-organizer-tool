@@ -1,4 +1,4 @@
-import tempfile, os, re, csv, shutil, subprocess, json
+import sys, tempfile, os, re, csv, shutil, subprocess, json
 import reverse_geocoder as rg
 import pycountry
 
@@ -28,7 +28,15 @@ if not os.path.exists(EXIFTOOL_EXE):
     if os.path.exists(alt):
         EXIFTOOL_EXE = alt
 
-BASE_FOLDER = r"C:\Users\Alex2\Downloads\Application document\personal\data science project\travel-photo\travel-photo"
+# --- Base folder setup (user chooses or default = script folder) ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_FOLDER = os.path.join(SCRIPT_DIR, "photos_to_organize")
+
+# Create a "photos_to_organize" folder next to the script if it doesn't exist
+os.makedirs(BASE_FOLDER, exist_ok=True)
+print(f"📁 Base folder: {BASE_FOLDER}")
+print("👉 Place your photos and videos inside this folder before running the script.")
+
 LOG_CSV = os.path.join(BASE_FOLDER, "organize_fast_log.csv")
 
 # --- File types we care about ---
@@ -66,8 +74,10 @@ def parse_gps_string(s):
             pass
     return None
 
+# ---------- Make a folder if it does not exist. ----------
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
+# ---------- Get a unique file path (avoid overwrites) ----------
 def unique_path(dest_path):
     if not os.path.exists(dest_path): return dest_path
     base, ext = os.path.splitext(dest_path)
@@ -77,6 +87,7 @@ def unique_path(dest_path):
         if not os.path.exists(cand): return cand
         i += 1
 
+# ---------- Moves a file safely to a new folder ----------
 def safe_move(src, dst_dir):
     ensure_dir(dst_dir)
     dst_path = os.path.join(dst_dir, os.path.basename(src))
@@ -165,12 +176,14 @@ def run_exiftool_tree(root):
 # ---------- Metadata helpers ----------
 ISO6709 = re.compile(r"^([+\-]\d+(?:\.\d+)?)([+\-]\d+(?:\.\d+)?)(?:[+\-]\d+(?:\.\d+)?/)?$")
 
+# ---------- Parse ISO-6709 string(e.g. +49.0115+12.0994) ----------
 def parse_iso6709(s):
     m = ISO6709.match(s.strip().replace(" ", ""))
     if not m:
         return None
     return float(m.group(1)), float(m.group(2))
 
+# ---------- Extract lat/lon from metadata dict ----------
 def extract_latlon(meta: dict):
     if not meta:
         return None
@@ -250,6 +263,7 @@ def extract_latlon(meta: dict):
 
 DATE_PAT = re.compile(r"(\d{4})[:\-\/.](\d{2})[:\-\/.](\d{2})")
 
+# ---------- Extract YYYY-MM from metadata dict ----------
 def extract_month(meta, abs_path=None):
     # Prefer real capture/create timestamps; ignore File:* and generic ModifyDate
     preferred_keys = [
@@ -284,6 +298,7 @@ def extract_month(meta, abs_path=None):
                 pass
     return ""
 
+# ---------- Get stem variants for IMG_E#### <-> IMG_#### pairing ----------
 def stem_for_pair(path):
     name = os.path.splitext(os.path.basename(path))[0]
     m = re.match(r"^(IMG_)E(\d+)$", name, re.IGNORECASE)
@@ -389,7 +404,16 @@ def stem_for_pair_from_base(base_name):
 
 # ---------- Main ----------
 def main():
+
     print("\n=== FAST ORGANIZE: one-pass exiftool + batched geocode ===\n")
+    
+    # Check for files in BASE_FOLDER
+    if not any(os.scandir(BASE_FOLDER)):
+        print("\n⚠️  No photos found in 'photos_to_organize' folder.")
+        print("Please place your images or videos there and run the script again.")
+        input("Press Enter to exit...")
+        sys,exit(0)
+
     no_date_dir = os.path.join(BASE_FOLDER, "no_date")
     ensure_dir(no_date_dir)
 

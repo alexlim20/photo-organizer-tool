@@ -1,0 +1,4 @@
+reverse_geocoder
+pycountry
+pillow
+pillow-heif
