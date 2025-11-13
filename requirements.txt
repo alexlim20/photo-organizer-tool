@@ -1,0 +1,7 @@
+reverse_geocoder
+pycountry
+pillow
+pillow-heif
+PySide6
+opencv-python
+send2trash
