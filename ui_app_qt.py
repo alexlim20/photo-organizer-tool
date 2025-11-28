@@ -2,20 +2,26 @@
 import os, sys
 import main as organizer
 import hashlib, json
+import sqlite3
+from typing import List, Dict, Tuple
+import threading
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "error")
 import cv2
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtCore import (
     QDir, Qt, QSize, QObject, QThread, 
     Signal, QTimer, QEvent, QStandardPaths,
     QRunnable, QThreadPool, QItemSelectionModel, QModelIndex,
-    QMutex, QMutexLocker
+    QMutex, QMutexLocker,
+    QUrl,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSplitter, QListView,
     QAbstractItemView, QStatusBar, QStyleFactory, QMessageBox,
-    QFileSystemModel, QListView, QSplitterHandle, QFrame, QFileIconProvider
+    QFileSystemModel, QListView, QSplitterHandle, QFrame, QFileIconProvider,
+    QStackedWidget,
 )
 from PySide6.QtGui import (
     QKeySequence, QImageReader, QPixmap, 
@@ -25,6 +31,11 @@ from collections import OrderedDict
 
 from PIL import Image
 from pillow_heif import register_heif_opener # enable HEIC/HEIF reading in Pillow
+
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+except Exception:
+    QWebEngineView = None
 
 register_heif_opener() 
 
@@ -43,6 +54,343 @@ IMAGE_EXTS = [
 VIDEO_EXTS = [
     "*.mp4", "*.mov", "*.avi", "*.mkv", "*.m4v"
 ]
+
+# ============================================================================
+# 1. GPS Cache Database (persistent, fast lookups)
+# ============================================================================
+
+class GPSCache:
+    """
+    Optimized SQLite-backed cache.
+    """
+    def __init__(self, library_path: str):
+        cache_dir = os.path.join(library_path, "._cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        self.db_path = os.path.join(cache_dir, "gps_index.db")
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        # WAL mode allows faster concurrent reads/writes
+        conn.execute("PRAGMA journal_mode=WAL;") 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gps_points (
+                filepath TEXT PRIMARY KEY,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                country TEXT,
+                mtime INTEGER,
+                last_checked INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_latlon ON gps_points(lat, lon)")
+        conn.commit()
+        conn.close()
+
+    def get_known_mtimes(self) -> Dict[str, int]:
+        """
+        Returns a dict of {filepath: mtime} for ALL files currently in DB.
+        Used for instant 'is this file changed?' checks.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute("SELECT filepath, mtime FROM gps_points")
+        data = {row[0]: row[1] for row in cursor}
+        conn.close()
+        return data
+
+    def get_all_points(self, limit: int = 100000) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        # Only fetch valid coordinates
+        cursor = conn.execute(
+            "SELECT lat, lon, country, filepath FROM gps_points WHERE lat != 0 AND lon != 0 LIMIT ?", 
+            (limit,)
+        )
+        points = []
+        for row in cursor:
+            lat, lon, country, filepath = row
+            # Fallback label logic
+            label = country if country else "Photo"
+            points.append({
+                "lat": lat, "lon": lon, 
+                "label": label, "country": country
+            })
+        conn.close()
+        return points
+    
+    def get_clustered_points(self, zoom_level: int = 5) -> List[Dict]:
+        # Reuse your existing clustering logic here if you wish, 
+        # or just use get_all_points if using the CesiumJS client-side clustering.
+        return []
+
+    def save_batch(self, records: List[Tuple]):
+        """
+        Bulk insert/update to minimize transaction overhead.
+        records: list of (filepath, lat, lon, country, mtime, now_ts)
+        """
+        if not records: return
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany("""
+                INSERT OR REPLACE INTO gps_points
+                (filepath, lat, lon, country, mtime, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, records)
+            conn.commit()
+        except Exception as e:
+            print(f"[GPS Cache] Save batch error: {e}")
+        finally:
+            conn.close()
+
+# ============================================================================
+# 2. Background GPS Indexer (non-blocking)
+# ============================================================================
+
+class GPSIndexerThread(QThread):
+    """
+    High-Performance Background Indexer
+    Uses 'exiftool -@ argfile' to scan thousands of files in a single process.
+    """
+    progress = Signal(int)            # processed count
+    intermediate_points = Signal(list) # batches for live UI update
+    finished_with_count = Signal(int)
+    error = Signal(str)
+
+    def __init__(self, library_path: str, parent=None):
+        super().__init__(parent)
+        self.library_path = library_path
+        self._stop_flag = False
+
+    def stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        import subprocess
+        import tempfile
+        import time
+        
+        try:
+            cache = GPSCache(self.library_path)
+            
+            # 1. LOAD STATE: Get all existing mtimes from DB (Instant)
+            print("[GPS Indexer] Loading database state...")
+            raw_known = cache.get_known_mtimes()
+            known_files = {k.lower(): v for k, v in raw_known.items()}
+
+            print(f"[DEBUG] Database has {len(known_files)} entries")
+            if len(known_files) > 0:
+                sample_key = list(known_files.keys())[0]
+                print(f"[DEBUG] Sample DB key: '{sample_key}'")
+            
+            # 2. FAST SCAN: Walk filesystem to find changed/new files
+            print("[GPS Indexer] Scanning directory structure...")
+            to_scan = []       # Files that need ExifTool analysis
+            files_checked = 0
+            
+            img_exts = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".tif", ".tiff", ".dng", ".cr2", ".arw"}
+            vid_exts = {".mov", ".mp4", ".m4v", ".avi", ".mkv"}
+            valid_exts = img_exts | vid_exts
+
+            # Pre-compiled regex for speed if needed, but endswith is fast enough
+            
+            for root, dirs, files in os.walk(self.library_path):
+                if self._stop_flag: break
+                
+                # Skip internal folders
+                if "_incoming" in root or "._" in root:
+                    continue
+                
+                # Try to guess country from folder path (fast fallback)
+                country_guess = None
+                parts = root.split(os.sep)
+                for p in parts:
+                    if p.startswith("country_"):
+                        country_guess = p.replace("country_", "")
+                        break
+                
+                for fname in files:
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in valid_exts:
+                        continue
+                        
+                    filepath_raw = os.path.join(root, fname)
+                    # 2. Create a "normalized" path (forward slashes) to check against the DB
+                    filepath_normalized = filepath_raw.replace("\\", "/")
+                    try:
+                        mtime = int(os.path.getmtime(filepath_raw))
+                    except OSError:
+                        continue
+                    
+                    # 3. Check the DB using the NORMALIZED path
+                    if filepath_normalized.lower() in known_files and known_files[filepath_normalized.lower()] == mtime:
+                        continue # Skip!
+
+                    # 4. If we must scan, use the raw path
+                    to_scan.append((filepath_normalized, mtime, country_guess))
+                    
+                files_checked += len(files)
+                if files_checked % 5000 == 0:
+                    print(f"[GPS Indexer] Walked {files_checked} files...")
+
+            total_new = len(to_scan)
+            print(f"[GPS Indexer] Analysis done. {total_new} files need GPS extraction.")
+            
+            if total_new == 0:
+                self.finished_with_count.emit(0)
+                return
+
+            # 3. BATCH PROCESSING: Send files to ExifTool in chunks of 1000
+            # This prevents "Command line too long" errors and gives UI updates
+            CHUNK_SIZE = 100
+            processed_count = 0
+            
+            # Find ExifTool path (borrowed from main.py logic)
+            exif_exe = "exiftool" # Assume in PATH by default
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            local_exif = os.path.join(script_dir, "exiftool.exe")
+            if os.path.exists(local_exif):
+                exif_exe = local_exif
+
+            for i in range(0, total_new, CHUNK_SIZE):
+                if self._stop_flag: break
+                
+                chunk = to_scan[i : i + CHUNK_SIZE]
+                
+                # Create a temporary file listing all paths for this chunk
+                # This is the "-@" argument feature of ExifTool
+                with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False) as arg_file:
+                    for item in chunk:
+                        path = item[0]
+                        # Normalize path separators
+                        arg_file.write(path.replace("\\", "/") + "\n")
+                    arg_file_path = arg_file.name
+
+                try:
+                    # Run ExifTool ONCE for 1000 files
+                    # -fast: avoid scanning end of JPEGs 
+                    # -n: numeric output (easier parsing)
+                    # -p: custom output format allows parsing without heavy JSON overhead
+                    # requesting specific GPS tags only
+                    cmd = [
+                        exif_exe,
+                        "-@", arg_file_path,
+                        "-n", 
+                        "-fast", 
+                        "-j",  # JSON output is safest for special characters
+                        "-GPSLatitude", "-GPSLongitude", 
+                        "-GPSPosition", "-Composite:GPSPosition",
+                        "-ignoreMinorErrors"
+                    ]
+                    
+                    # On Windows, suppress console window
+                    startupinfo = None
+                    if os.name == 'nt':
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    
+                    proc = subprocess.run(
+                        cmd, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.DEVNULL,
+                        text=True, 
+                        encoding='utf-8',
+                        errors='replace',
+                        startupinfo=startupinfo
+                    )
+                    
+                    if proc.stdout:
+                        data = json.loads(proc.stdout)
+                        
+                        # Map source file back to our queue data (mtime, country)
+                        # We use a dictionary for O(1) lookup of the chunk data
+                        # Key: normalized absolute path
+                        chunk_map = {}
+                        for item in chunk:
+                            # item[0] is the raw path from os.walk
+                            # Force E:/photos/file.jpg format
+                            clean_key = item[0].replace("\\", "/").lower()
+                            chunk_map[clean_key] = (item[1], item[2])
+                        
+                        db_batch = []
+                        ui_batch = []
+                        now_ts = int(time.time())
+                        
+                        for record in data:
+                            src = record.get("SourceFile", "")
+                            if not src: continue
+                            
+                            # 2. Convert ExifTool path to match our clean key
+                            # ExifTool usually gives E:/Photos/File.jpg
+                            src_key = src.replace("\\", "/").lower()
+                            
+                            meta_data = chunk_map.get(src_key)
+                            
+                            # SAFETY NET: If match fails, try one fallback, then PRINT THE ERROR
+                            if not meta_data:
+                                # Sometimes Exiftool resolves symlinks, so try the raw src just in case
+                                meta_data = chunk_map.get(src.lower())
+                                
+                            if not meta_data:
+                                # THIS IS THE DEBUG LINE THAT WAS MISSING
+                                # It will tell us if we are still losing data
+                                print(f"[CRITICAL FAILURE] Could not match ExifTool file: {src}")
+                                print(f"   -> We looked for key: {src_key}")
+                                # print(f"   -> Available keys: {list(chunk_map.keys())[0]}...") # Uncomment if needed
+                                continue
+                                
+                            mtime, country_fallback = meta_data
+                            
+                            # Extract Lat/Lon
+                            lat = record.get("GPSLatitude")
+                            lon = record.get("GPSLongitude")
+                            
+                            # Handle Composite string format "lat lon" if individual tags fail
+                            if lat is None and "Composite:GPSPosition" in record:
+                                try:
+                                    parts = record["Composite:GPSPosition"].split()
+                                    if len(parts) >= 2:
+                                        lat = float(parts[0])
+                                        lon = float(parts[1])
+                                except: pass
+                                
+                            # Final validation
+                            try:
+                                lat = float(lat)
+                                lon = float(lon)
+                            except (TypeError, ValueError):
+                                lat = 0.0
+                                lon = 0.0
+                            db_batch.append((src_key, lat, lon, country_fallback, mtime, now_ts))
+                            
+                            base_name = os.path.basename(src)
+                            label = f"{country_fallback} Â· {base_name}" if country_fallback else base_name
+                            ui_batch.append({
+                                "lat": lat, "lon": lon, 
+                                "label": label, "country": country_fallback
+                            })
+
+                        # Batch save to DB
+                        cache.save_batch(db_batch)
+                        
+                        # Emit to UI
+                        if ui_batch:
+                            self.intermediate_points.emit(ui_batch)
+
+                    processed_count += len(chunk)
+                    self.progress.emit(processed_count)
+                    
+                except Exception as e:
+                    print(f"[GPS Indexer] Batch Error: {e}")
+                finally:
+                    # Cleanup temp file
+                    if os.path.exists(arg_file_path):
+                        os.unlink(arg_file_path)
+
+            self.finished_with_count.emit(processed_count)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
 
 class ThumbnailFileSystemModel(QFileSystemModel):
     def __init__(self, thumb_size=QSize(256, 256), parent=None):
@@ -129,6 +477,22 @@ class ThumbnailFileSystemModel(QFileSystemModel):
             return QPixmap.fromImage(qimg)
         except Exception:
             return None
+        
+class GlobeWorker(QThread):
+    finished_points = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, folder: str, parent=None):
+        super().__init__(parent)
+        self.folder = folder
+
+    def run(self):
+        try:
+            points = collect_gps_points(self.folder)
+        except Exception as e:
+            self.error.emit(str(e))
+        else:
+            self.finished_points.emit(points)
 
 class WorkerThread(QThread):
     finished_ok = Signal()
@@ -227,7 +591,7 @@ class ThumbnailIconProvider(QFileIconProvider):
         super().__init__()
         cache_root = QStandardPaths.writableLocation(QStandardPaths.CacheLocation) or os.path.expanduser("~/.cache")
         self.disk_cache_dir = os.path.join(cache_root, "travel_photo_organizer", "thumbs")
-        # (debug) print("🗂️ Disk thumbnail cache is at:", self.disk_cache_dir)
+        # (debug) print("ðŸ—‚ï¸  Disk thumbnail cache is at:", self.disk_cache_dir)
         os.makedirs(self.disk_cache_dir, exist_ok=True)
 
         self.thumb_size = thumb_size
@@ -271,7 +635,7 @@ class ThumbnailIconProvider(QFileIconProvider):
         # NEW: write to disk cache (best-effort)
         try:
             disk_p = self._disk_thumb_path(path, self.thumb_size)
-            # PNG is fine for tiny thumbs; it’s fast & supports alpha
+            # PNG is fine for tiny thumbs; itâ€™s fast & supports alpha
             px.save(disk_p, "PNG")
         except Exception:
             pass
@@ -280,7 +644,7 @@ class ThumbnailIconProvider(QFileIconProvider):
         return True
 
     def _build_image_sync(self, path: str, size: int, expected_gen: int):
-        # gen changed → stop
+        # gen changed â†’ stop
         if expected_gen != self.gen:
             return False
         self._image_gate.acquire()
@@ -340,7 +704,7 @@ class ThumbnailIconProvider(QFileIconProvider):
                 except Exception:
                     return False
             else:
-                # ✅ Qt read succeeded — cache it
+                # âœ… Qt read succeeded â€” cache it
                 if expected_gen != self.gen:
                     return False
                 return self._cache_icon(path, QPixmap.fromImage(img))
@@ -480,7 +844,7 @@ class ThumbnailIconProvider(QFileIconProvider):
             #    dprint(f"[done/STALE] gen={gen}!=curr={self.gen} :: {path}")
         #    return
         if gen != self.gen:
-            # stale completion from a previous folder — ignore
+            # stale completion from a previous folder â€” ignore
             return
         n = self._norm(path)
         self._inflight.discard(n)
@@ -537,6 +901,783 @@ class FSModel(QFileSystemModel):
                 if ico is not None:
                     return ico
         return super().data(index, role)
+    
+class GlobeWidget(QWidget):
+    """
+    Globe widget with improved debugging and error handling
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._points = []
+        self._use_clustering = True
+        
+        if QWebEngineView is None:
+            self.info = QLabel("Globe view requires Qt WebEngine.")
+            self.info.setAlignment(Qt.AlignCenter)
+            layout.addWidget(self.info)
+            self.view = None
+            
+        else:
+            self.info = None
+            self.view = QWebEngineView(self)
+
+            # NEW: Hook JS errors globally
+            self.view.page().javaScriptConsoleMessage = self._js_console_message
+            self.view.urlChanged.connect(lambda url: print(f"[Globe] Nav to: {url.toString()}"))
+            self.view.setZoomFactor(1.05)
+
+            # ======= NEW: Add map style toggle button =======
+            self.map_style_btn = QPushButton("ðŸ—ºï¸ ", self)
+            self.map_style_btn.setFixedSize(40, 40)
+            self.map_style_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.9);
+                    border: 2px solid #ccc;
+                    border-radius: 20px;
+                    font-size: 18px;
+                    padding: 0px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 255, 255, 1.0);
+                    border-color: #666;
+                }
+                QPushButton:pressed {
+                    background-color: rgba(230, 230, 230, 1.0);
+                }
+            """)
+            self.map_style_btn.setToolTip("Toggle: Satellite â†” Street Map")
+            self.map_style_btn.clicked.connect(self._toggle_map_style)
+            self.map_style_btn.raise_()  # Keep button on top
+            self._current_style = "satellite"  # Track current style
+            # ======= END NEW CODE =======
+
+            layout.addWidget(self.view)
+
+            self._is_loaded = False
+            
+            # Enable JS console and debugging
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+            settings = self.view.settings()
+            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, True)
+            
+            # Connect to console messages for debugging
+            self.view.page().javaScriptConsoleMessage = self._js_console_message
+            self.view.loadFinished.connect(lambda ok: print(f"[Globe] Load done: {'OK' if ok else 'FAIL'}"))
+
+    def _js_console_message(self, level, message, line, source):
+        """Capture JavaScript console messages for debugging"""
+        print(f"[JS Console] {message} (line {line})")
+    
+    def set_points(self, points, use_clustering=True):
+        self._points = points or []
+        print(f"[Globe] set_points: {len(self._points)} pts")
+        
+        # 1. IF GLOBE IS ALREADY LOADED: Update data via JS (No Camera Reset)
+        if self._is_loaded and self.view:
+            valid_points = []
+            for p in self._points:
+                 if isinstance(p.get('lat'), (int, float)) and isinstance(p.get('lon'), (int, float)):
+                     valid_points.append({
+                         'lat': float(p['lat']),
+                         'lon': float(p['lon']),
+                         'label': str(p.get('label', 'Photo')),
+                         'country': str(p.get('country', ''))
+                     })
+            
+            import json
+            json_str = json.dumps(valid_points)
+            
+            # Call the new JS function that swaps data without reloading viewer
+            js_code = """
+            (function() {
+                if (typeof replaceAllPoints === 'function') {
+                    replaceAllPoints(PERCENT_DATA_PERCENT);
+                }
+            })();
+            """.replace("PERCENT_DATA_PERCENT", json_str)
+            
+            self.view.page().runJavaScript(js_code)
+            print("[Globe] Updated points via JS (Camera preserved)")
+            return
+
+        # 2. IF GLOBE IS NOT LOADED: Build it from scratch
+        if self.view:
+            self._render_globe()
+    
+class GlobeWidget(QWidget):
+    """
+    Globe widget: Optimized for 25,000+ points without culling or limits.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._points = []
+        
+        if QWebEngineView is None:
+            self.info = QLabel("Globe view requires Qt WebEngine.")
+            self.info.setAlignment(Qt.AlignCenter)
+            layout.addWidget(self.info)
+            self.view = None
+        else:
+            self.view = QWebEngineView(self)
+            
+            # Debugging setup
+            self.view.page().javaScriptConsoleMessage = self._js_console_message
+            self.view.urlChanged.connect(lambda url: print(f"[Globe] Nav to: {url.toString()}"))
+            
+            # Map Style Button
+            self.map_style_btn = QPushButton("ðŸ—ºï¸ ", self)
+            self.map_style_btn.setFixedSize(40, 40)
+            self.map_style_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.9);
+                    border: 2px solid #ccc;
+                    border-radius: 20px;
+                    font-size: 18px;
+                }
+                QPushButton:hover { background-color: white; border-color: #666; }
+            """)
+            self.map_style_btn.clicked.connect(self._toggle_map_style)
+            self._current_style = "satellite"
+            
+            layout.addWidget(self.view)
+            
+            # Performance Settings
+            settings = self.view.settings()
+            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'map_style_btn'):
+            self.map_style_btn.move(self.width() - 50, 10)
+
+    def _js_console_message(self, level, message, line, source):
+        if "Blocking XFrameOptions" in message: return
+        print(f"[Globe JS] {message} (line {line})")
+
+    def _toggle_map_style(self):
+        if not self.view: return
+        
+        script = ""
+        if self._current_style == "satellite":
+            # --- FIX: Send 'dark' to match the JavaScript ---
+            script = "setMapStyle('dark');"  
+            self._current_style = "dark"
+            self.map_style_btn.setToolTip("Switch to Satellite")
+        else:
+            script = "setMapStyle('satellite');"
+            self._current_style = "satellite"
+            self.map_style_btn.setToolTip("Switch to Dark Map")
+            
+        self.view.page().runJavaScript(script)
+
+    def set_points(self, points, use_clustering=True):
+        self._points = points or []
+        print(f"[Globe] set_points: {len(self._points)} pts")
+        if self.view:
+            self._render_globe()
+
+    def add_batch_js(self, new_points: list):
+        """Injects new points safely into the running globe"""
+        if not new_points or not self.view: return
+
+        valid_batch = []
+        for p in new_points:
+             if isinstance(p.get('lat'), (int, float)) and isinstance(p.get('lon'), (int, float)):
+                 valid_batch.append({
+                     'lat': float(p['lat']),
+                     'lon': float(p['lon']),
+                     'label': str(p.get('label', 'Photo')),
+                     'country': str(p.get('country', ''))
+                 })
+        
+        if not valid_batch: return
+
+        import json
+        # We use a placeholder replacement approach even here to be safe
+        json_str = json.dumps(valid_batch)
+        
+        js_code = """
+        (function() {
+            if (typeof addPointsBatch === 'function') {
+                addPointsBatch(PERCENT_DATA_PERCENT);
+            }
+        })();
+        """.replace("PERCENT_DATA_PERCENT", json_str)
+
+        self.view.page().runJavaScript(js_code)
+
+    def _render_globe(self):
+        """
+        Render globe with:
+        1. Google-Style Label Collision.
+        2. High-Performance State Borders (Primitives).
+        3. SMART VISIBILITY: State borders hide from space to fix lag.
+        4. Photo Clustering.
+        """
+        import json
+        from PySide6.QtCore import QUrl
+    
+        self._has_been_rendered = False
+        self._is_loaded = False
+        
+        valid_points = []
+        for p in self._points: 
+            if isinstance(p.get('lat'), (int, float)) and isinstance(p.get('lon'), (int, float)):
+                valid_points.append({
+                    'lat': float(p['lat']),
+                    'lon': float(p['lon']),
+                    'label': str(p.get('label', 'Photo')),
+                    'country': str(p.get('country', ''))
+                })
+    
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_assets")
+        os.makedirs(assets_dir, exist_ok=True)
+        
+        border_file_abs = os.path.join(assets_dir, "optimized_borders.json").replace("\\", "/")
+        border_url = f"file:///{border_file_abs}"
+        has_local_borders = os.path.exists(os.path.join(assets_dir, "optimized_borders.json"))
+        
+        detected_name_key = "name"
+        if has_local_borders:
+            try:
+                with open(os.path.join(assets_dir, "optimized_borders.json"), 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if "features" in data and len(data["features"]) > 0:
+                        props = data["features"][0].get("properties", {})
+                        candidates = ["name", "NAME", "NAME_1", "admin_name", "woe_name"]
+                        for c in candidates:
+                            if c in props:
+                                detected_name_key = c
+                                break
+            except: pass
+
+        settings = self.view.settings()
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+
+        base_url = QUrl.fromLocalFile(os.path.join(assets_dir, ""))
+        
+        html_template = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
+      <style>
+        html, body {{ 
+            margin: 0; padding: 0; width: 100%; height: 100%; 
+            overflow: hidden; background: #000; 
+            font-family: 'Roboto', sans-serif; 
+        }}
+        #cesiumContainer {{ width: 100%; height: 100%; display: block; }}
+      </style>
+      <script src="Cesium/Cesium.js"></script>
+      <link href="Cesium/Widgets/widgets.css" rel="stylesheet" />
+    </head>
+    <body>
+      <div id="cesiumContainer"></div>
+    
+      <script>
+      var viewer = null;
+      var allPoints = []; 
+      
+      var userPointCollection = null;
+      var userLabelCollection = null;
+      
+      var updateTimeout = null;    
+      var collisionTimeout = null; 
+      var labelEntities = [];      
+      
+      var stateBordersPrimitive = null; 
+
+      var LOCAL_BORDER_URL = "{border_url}";
+      var HAS_LOCAL_BORDERS = {str(has_local_borders).lower()};
+      var NAME_KEY = "{detected_name_key}";
+
+      (function initViewer() {{
+        if (typeof Cesium === 'undefined') return;
+    
+        try {{
+            Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJmOGVmNmIxYy0yYTkwLTRjN2QtYWEyYy1lNWZmNmE2YmY0YzkiLCJpZCI6MzYxMTAzLCJpYXQiOjE3NjMzNzcyMDd9.6v-mLQxQSwC6r2FaxJWPJATP3Jw977W7VTsuS-ue3Dc';
+    
+            viewer = new Cesium.Viewer('cesiumContainer', {{
+              animation: false, timeline: false, baseLayerPicker: false, geocoder: false,
+              sceneModePicker: false, navigationHelpButton: false, homeButton: false,
+              fullscreenButton: false, infoBox: false, selectionIndicator: false,
+              shouldAnimate: false, requestRenderMode: true, maximumRenderTimeChange: Infinity
+            }});
+
+            viewer.scene.requestRenderMode = true;
+            viewer.scene.maximumRenderTimeChange = 0.001;
+            viewer.shadowMap.size = 1024;
+            viewer.scene.highDynamicRange = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.0001;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.globe.maximumScreenSpaceError = 2;
+            
+            viewer.resolutionScale = window.devicePixelRatio || 1.0;
+            viewer.scene.postProcessStages.fxaa.enabled = false;
+            viewer.scene.screenSpaceCameraController.minimumZoomDistance = 1000;
+            
+            viewer.imageryLayers.removeAll();
+            viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
+                url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+                credit: 'ESRI'
+            }}));
+
+            userPointCollection = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+            userLabelCollection = viewer.scene.primitives.add(new Cesium.LabelCollection());
+            
+            loadHighDetailLabels();
+            loadBoundaries();
+    
+            viewer.camera.moveEnd.addEventListener(function() {{
+                if (collisionTimeout) clearTimeout(collisionTimeout);
+                collisionTimeout = setTimeout(updateLabelCollisions, 100);
+                
+                if (updateTimeout) clearTimeout(updateTimeout);
+                updateTimeout = setTimeout(updatePointsForZoom, 150);
+            }});
+            
+            viewer.scene.preUpdate.addEventListener(function() {{
+                updateBorderVisibility(); 
+            }});
+            
+            setTimeout(updateLabelCollisions, 1000);
+            setTimeout(updatePointsForZoom, 1000);
+
+        }} catch(e) {{ console.error(e); }}
+      }})();
+
+      var lastBorderState = null;
+      function updateBorderVisibility() {{
+          if (stateBordersPrimitive) {{
+              var height = viewer.camera.positionCartographic.height;
+              var shouldShow = (height < 1000000);
+              
+              if (lastBorderState !== shouldShow) {{
+                  lastBorderState = shouldShow;
+                  if (shouldShow) {{
+                      stateBordersPrimitive.show = true;
+                      viewer.scene.requestRender();
+                  }} else {{
+                      stateBordersPrimitive.show = false;
+                  }}
+              }}
+          }}
+      }}
+
+      var lastCameraHeight = 0;
+      function updateLabelCollisions() {{
+          if (!viewer || labelEntities.length === 0) return;
+          
+          var height = viewer.camera.positionCartographic.height;
+          if (Math.abs(height - lastCameraHeight) / lastCameraHeight < 0.1) {{
+              return;
+          }}
+          lastCameraHeight = height;
+
+          var scene = viewer.scene;
+          var camera = scene.camera;
+          var ellipsoid = scene.globe.ellipsoid;
+          var canvasHeight = scene.canvas.clientHeight;
+          var canvasWidth = scene.canvas.clientWidth;
+
+          if (height > 20000000) {{
+              labelEntities.forEach(item => {{ item.entity.label.show = false; }});
+              viewer.scene.requestRender();
+              return;
+          }}
+
+          labelEntities.sort(function(a, b) {{ return a.rank - b.rank; }});
+          
+          var visibleLabels = labelEntities.filter(item => {{
+              var distance = Cesium.Cartesian3.distance(
+                  viewer.camera.position,
+                  Cesium.Cartesian3.fromDegrees(item.lon, item.lat)
+              );
+              return distance < height * 2; 
+          }});
+
+          var placedBoxes = []; 
+
+          for (var i = 0; i < visibleLabels.length; i++) {{
+              var item = visibleLabels[i];
+              var entity = item.entity;
+              
+              var position = Cesium.Cartesian3.fromDegrees(item.lon, item.lat);
+              var occluded = new Cesium.EllipsoidalOccluder(ellipsoid, camera.position).isPointVisible(position);
+              if (!occluded) {{ entity.label.show = false; continue; }}
+
+              var screenPos = scene.cartesianToCanvasCoordinates(position);
+              if (!screenPos) {{ entity.label.show = false; continue; }}
+
+              if (screenPos.x < 0 || screenPos.y < 0 || 
+                  screenPos.x > canvasWidth || screenPos.y > canvasHeight) {{
+                  entity.label.show = false;
+                  continue;
+              }}
+
+              var boxW = (item.rank >= 5) ? 50 : 70;
+              var boxH = 30;
+              var myBox = {{ x: screenPos.x - boxW/2, y: screenPos.y - boxH/2, w: boxW, h: boxH }};
+
+              var collision = false;
+              for (var j = 0; j < placedBoxes.length; j++) {{
+                  var other = placedBoxes[j];
+                  if (myBox.x < other.x + other.w && myBox.x + myBox.w > other.x &&
+                      myBox.y < other.y + other.h && myBox.y + myBox.h > other.y) {{
+                      collision = true;
+                      break;
+                  }}
+              }}
+
+              if (collision) {{ entity.label.show = false; }} 
+              else {{ entity.label.show = true; placedBoxes.push(myBox); }}
+          }}
+          viewer.scene.requestRender();
+      }}
+
+      function loadBoundaries() {{
+          console.log("Loading boundaries...");
+
+          Cesium.GeoJsonDataSource.load(
+              'https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/ne_50m_admin_0_boundary_lines_land.geojson',
+              {{ clampToGround: false }} 
+          ).then(function(ds) {{
+              var entities = ds.entities.values;
+              for (var i = 0; i < entities.length; i++) {{
+                  var entity = entities[i];
+                  if (entity.polyline) {{
+                      entity.polyline.material = Cesium.Color.WHITE.withAlpha(0.6);
+                      entity.polyline.width = 1.0;
+                      entity.polyline.arcType = Cesium.ArcType.GEODESIC;
+                  }}
+              }}
+              viewer.dataSources.add(ds);
+          }});
+          
+          var stateLinesUrl = 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_1_states_provinces_lines.geojson';
+          
+          fetch(stateLinesUrl)
+            .then(response => response.json())
+            .then(data => {{
+                var instances = [];
+                function addLine(coordinates) {{
+                    var flatCoords = [];
+                    for (var i = 0; i < coordinates.length; i++) {{
+                        flatCoords.push(coordinates[i][0], coordinates[i][1]);
+                    }}
+                    if (flatCoords.length < 4) return;
+
+                    instances.push(new Cesium.GeometryInstance({{
+                        geometry: new Cesium.PolylineGeometry({{
+                            positions: Cesium.Cartesian3.fromDegreesArray(flatCoords),
+                            width: 1.5,
+                            arcType: Cesium.ArcType.GEODESIC
+                        }})
+                    }}));
+                }}
+
+                if (data.features) {{
+                    for (var i = 0; i < data.features.length; i++) {{
+                        var geom = data.features[i].geometry;
+                        if (!geom) continue;
+                        if (geom.type === "LineString") {{
+                            addLine(geom.coordinates);
+                        }} else if (geom.type === "MultiLineString") {{
+                            for (var j = 0; j < geom.coordinates.length; j++) {{
+                                addLine(geom.coordinates[j]);
+                            }}
+                        }}
+                    }}
+                }}
+                
+                if (instances.length > 0) {{
+                    stateBordersPrimitive = new Cesium.Primitive({{
+                        geometryInstances: instances,
+                        appearance: new Cesium.PolylineMaterialAppearance({{
+                            material: Cesium.Material.fromType('PolylineDash', {{
+                                color: Cesium.Color.WHITE.withAlpha(0.3),
+                                dashLength: 8.0
+                            }})
+                        }}),
+                        asynchronous: true 
+                    }});
+                    
+                    var height = viewer.camera.positionCartographic.height;
+                    stateBordersPrimitive.show = (height < 6000000);
+                    viewer.scene.primitives.add(stateBordersPrimitive);
+                }}
+            }})
+            .catch(error => {{
+                console.error("Failed to load state borders: " + error);
+            }});
+          
+          if (HAS_LOCAL_BORDERS) {{
+               loadLocalLabelsOnly();
+          }}
+      }}
+
+      function loadLocalLabelsOnly() {{
+          Cesium.GeoJsonDataSource.load(LOCAL_BORDER_URL, {{ clampToGround: false }}).then(function(ds) {{
+              var entities = ds.entities.values;
+              for (var i = 0; i < entities.length; i++) {{
+                  var entity = entities[i];
+                  if (entity.polygon) entity.polygon.show = false;
+                  if (entity.polyline) entity.polyline.show = false;
+                  
+                  var rawName = entity.properties[NAME_KEY];
+                  if (rawName) {{
+                      entity.label = {{
+                          text: rawName.toString().toUpperCase(),
+                          font: '600 10px Roboto, sans-serif',
+                          fillColor: Cesium.Color.WHITE.withAlpha(0.7),
+                          style: Cesium.LabelStyle.FILL,
+                          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 3000000),
+                          heightReference: Cesium.HeightReference.NONE,
+                          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+                          translucencyByDistance: new Cesium.NearFarScalar(1.0e6, 1.0, 3.5e6, 0.0)
+                      }};
+                      entity.show = true; 
+                  }} else {{
+                      entity.show = false;
+                  }}
+              }}
+              viewer.dataSources.add(ds);
+          }}).catch(function(e){{ console.error(e); }});
+      }}
+
+      function loadHighDetailLabels() {{
+          var countryUrl = 'https://raw.githubusercontent.com/mledoze/countries/master/dist/countries.json';
+          Cesium.Resource.fetchJson(countryUrl).then(function(data) {{
+              data.forEach(function(country) {{
+                  var lat = country.latlng[0];
+                  var lon = country.latlng[1];
+                  var name = country.name.common || country.name;
+                  var area = country.area || 0; 
+                  if (!lat || !lon) return;
+                  
+                  var rank = 4; 
+                  if (area > 2500000) rank = 1;      
+                  else if (area > 400000) rank = 2;  
+                  else if (area > 50000) rank = 3;   
+
+                  addLabel(name.toUpperCase(), lat, lon, rank);
+              }});
+          }});
+          
+          Cesium.Resource.fetchJson('https://d2ad6b4ur7yvpq.cloudfront.net/naturalearth-3.3.0/ne_10m_populated_places_simple.geojson').then(function(data) {{
+              data.features.forEach(function(feature) {{
+                  var coords = feature.geometry.coordinates;
+                  var props = feature.properties;
+                  var pop = props.pop_max || 0;
+                  var name = props.name;
+                  
+                  if (pop > 1000000) {{
+                      addLabel(name, coords[1], coords[0], 5);
+                  }}
+              }});
+          }});
+      }}
+
+      function addLabel(text, lat, lon, rank) {{
+          var displayScale = 0.5;
+          var fontSize = (rank === 1) ? 28 : (rank === 5 ? 20 : 24);
+          var fontWeight = (rank === 5) ? '700' : '900';
+          var font = fontWeight + ' ' + fontSize + 'px Roboto, sans-serif';
+          
+          var translucency;
+          if (rank <= 2) {{ 
+              translucency = new Cesium.NearFarScalar(6.0e6, 1.0, 1.0e7, 0.0);
+          }} else if (rank <= 4) {{ 
+              translucency = new Cesium.NearFarScalar(4.0e6, 1.0, 7.0e6, 0.0);
+          }} else {{ 
+              translucency = new Cesium.NearFarScalar(1.5e6, 1.0, 6.0e6, 0.0);
+          }}
+
+          var entity = viewer.entities.add({{
+              position: Cesium.Cartesian3.fromDegrees(lon, lat),
+              label: {{
+                  text: text,
+                  font: font,
+                  scale: displayScale,
+                  fillColor: Cesium.Color.WHITE,
+                  style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                  outlineColor: Cesium.Color.BLACK.withAlpha(0.8),
+                  outlineWidth: 6,
+                  horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+                  verticalOrigin: Cesium.VerticalOrigin.CENTER,
+                  
+                  translucencyByDistance: translucency,
+                  
+                  heightReference: Cesium.HeightReference.NONE,
+                  eyeOffset: new Cesium.Cartesian3(0.0, 0.0, -50000.0),
+                  distanceDisplayCondition: undefined,
+                  scaleByDistance: new Cesium.NearFarScalar(1.0, 1.0, 1.0e8, 1.0),
+                  disableDepthTestDistance: Number.POSITIVE_INFINITY
+              }}
+          }});
+          
+          labelEntities.push({{ entity: entity, rank: rank, lat: lat, lon: lon }});
+      }}
+      
+      function replaceAllPoints(newSet) {{
+          allPoints = newSet;
+          if (updatePointsForZoom) updatePointsForZoom();
+      }}
+      function addPointsBatch(newPts) {{
+          allPoints.push(...newPts);
+          setTimeout(updatePointsForZoom, 500);
+      }}
+      
+      var lastRenderHeight = 0;
+      function updatePointsForZoom() {{
+          if (!viewer || !userPointCollection) return;
+          
+          var height = viewer.camera.positionCartographic.height;
+          if (Math.abs(height - lastRenderHeight) / lastRenderHeight < 0.2) {{
+              return;
+          }}
+          lastRenderHeight = height;
+          
+          requestAnimationFrame(() => {{
+              userPointCollection.removeAll();
+              userLabelCollection.removeAll();
+              
+              var CLUSTER_THRESHOLD = 3000000;
+              if (height > CLUSTER_THRESHOLD) renderUserClusters(height);
+              else renderUserPoints();
+              
+              viewer.scene.requestRender();
+          }});
+      }}
+
+      // --- FIX START: Use CullingVolume instead of Frustum ---
+      function renderUserPoints() {{
+          var cullingVolume = viewer.camera.frustum.computeCullingVolume(
+              viewer.camera.position,
+              viewer.camera.direction,
+              viewer.camera.up
+          );
+          var culledPoints = 0;
+
+          for (var i = 0; i < allPoints.length; i++) {{
+              var p = allPoints[i];
+              var position = Cesium.Cartesian3.fromDegrees(p.lon, p.lat);
+              
+              if (viewer.scene.mode === Cesium.SceneMode.SCENE3D) {{
+                  var visible = cullingVolume.computeVisibility(
+                      new Cesium.BoundingSphere(position, 500)
+                  );
+                  if (visible === Cesium.Intersect.OUTSIDE) {{
+                      culledPoints++;
+                      continue;
+                  }}
+              }}
+
+              userPointCollection.add({{
+                  position: position,
+                  color: Cesium.Color.CYAN,
+                  pixelSize: 6,
+                  outlineColor: Cesium.Color.BLACK,
+                  outlineWidth: 1,
+                  eyeOffset: new Cesium.Cartesian3(0.0, 0.0, -500.0),
+                  distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 10000000)
+              }});
+          }}
+      }}
+      // --- FIX END ---
+
+      function renderUserClusters(height) {{
+          var grid = (height > 10000000) ? 10.0 : 4.0;
+          var clusters = new Map();
+          for (var i = 0; i < allPoints.length; i++) {{
+              var p = allPoints[i];
+              var k = Math.round(p.lat/grid)*grid + ',' + Math.round(p.lon/grid)*grid;
+              if (!clusters.has(k)) clusters.set(k, {{lat: Math.round(p.lat/grid)*grid, lon: Math.round(p.lon/grid)*grid, count: 0}});
+              clusters.get(k).count++;
+          }}
+          clusters.forEach(function(c) {{
+              var size = Math.min(40, 15 + Math.log(c.count) * 4);
+              userPointCollection.add({{
+                  position: Cesium.Cartesian3.fromDegrees(c.lon, c.lat),
+                  color: Cesium.Color.ORANGE.withAlpha(0.9),
+                  pixelSize: size,
+                  outlineColor: Cesium.Color.WHITE,
+                  outlineWidth: 2,
+                  eyeOffset: new Cesium.Cartesian3(0.0, 0.0, -500.0)
+              }});
+              userLabelCollection.add({{
+                  position: Cesium.Cartesian3.fromDegrees(c.lon, c.lat),
+                  text: c.count.toString(),
+                  font: 'bold 14px sans-serif',
+                  fillColor: Cesium.Color.WHITE,
+                  style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                  outlineWidth: 2,
+                  verticalOrigin: Cesium.VerticalOrigin.CENTER,
+                  horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+                  pixelOffset: new Cesium.Cartesian2(0, -2),
+                  eyeOffset: new Cesium.Cartesian3(0.0, 0.0, -600.0)
+              }});
+          }});
+      }}
+      
+      function setMapStyle(style) {{
+          if (!viewer) return;
+          viewer.imageryLayers.removeAll();
+          if (style === 'dark') {{
+              viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
+                  url: 'https://{{s}}.basemaps.cartocdn.com/dark_nolabels/{{z}}/{{x}}/{{y}}.png',
+                  subdomains: 'abcd',
+                  credit: 'CartoDB'
+              }}));
+          }} else {{
+              viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
+                  url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+                  credit: 'ESRI'
+              }}));
+          }}
+          viewer.scene.requestRender();
+      }}
+      </script>
+    </body>
+    </html>"""
+        
+        self.view.setHtml(html_template, base_url)
+        
+        def inject_data_when_ready():
+            def check_ready(is_ready):
+                if is_ready:
+                    CHUNK_SIZE = 5000
+                    for i in range(0, len(valid_points), CHUNK_SIZE):
+                        chunk = valid_points[i:i+CHUNK_SIZE]
+                        json_chunk = json.dumps(chunk)
+                        js = f"if (typeof replaceAllPoints === 'function' && {i}==0) replaceAllPoints({json_chunk}); else if (typeof addPointsBatch === 'function') addPointsBatch({json_chunk});"
+                        self.view.page().runJavaScript(js)
+                    self._is_loaded = True
+                    self._has_been_rendered = True
+                else:
+                    QTimer.singleShot(500, inject_data_when_ready)
+            
+            self.view.page().runJavaScript(
+                "typeof viewer !== 'undefined' && viewer !== null && typeof replaceAllPoints === 'function'",
+                check_ready
+            )
+        
+        QTimer.singleShot(1500, inject_data_when_ready)
 
 class MainWindow(QMainWindow):
     @staticmethod
@@ -580,6 +1721,20 @@ class MainWindow(QMainWindow):
         self.grid.setIconSize(QSize(icon_w, icon_w))
         self.grid.setGridSize(QSize(cell_w, cell_h))
         self.grid.setWordWrap(False)
+
+    def closeEvent(self, event):
+        # Stop the GPS thread if it is running
+        if hasattr(self, 'gps_indexer_thread') and self.gps_indexer_thread:
+            print("[Exit] Stopping GPS Indexer...")
+            self.gps_indexer_thread.stop()
+            self.gps_indexer_thread.wait(2000) # Wait up to 2 seconds for it to finish cleanly
+        
+        # Stop the Organizer thread if it is running
+        if hasattr(self, 'thread') and self.thread:
+             self.thread.terminate()
+             self.thread.wait()
+             
+        event.accept()
 
     def __init__(self):
         super().__init__()
@@ -636,7 +1791,7 @@ class MainWindow(QMainWindow):
 
         self.model = FSModel(self)                 # <-- use our model
         self.model.setIconProvider(provider)       # keep provider attached
-        # ➜ ONLY show images & videos (folders still visible)
+        # âžœ ONLY show images & videos (folders still visible)
         self.model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot | QDir.Files)
         self.model.setNameFilters(IMAGE_EXTS + VIDEO_EXTS)
         self.model.setNameFilterDisables(False)
@@ -702,7 +1857,7 @@ class MainWindow(QMainWindow):
         self.short_enter2.activated.connect(self.on_open_current)
 
         # --- Loading overlay (covers the grid while loading) ---
-        self.loading = QLabel("Loading folder…")
+        self.loading = QLabel("Loading folderâ€¦")
         self.loading.setAlignment(Qt.AlignCenter)
         self.loading.setStyleSheet("""
             background: rgba(0,0,0,0.35);
@@ -727,9 +1882,9 @@ class MainWindow(QMainWindow):
         right_v.setContentsMargins(0, 0, 0, 0)
         right_v.setSpacing(6)
 
-        self.back_btn = QPushButton("◀ Back")
+        self.back_btn = QPushButton("â—€ Back")
         self.back_btn.setFocusPolicy(Qt.NoFocus)
-        self.path_now = QLabel("—")
+        self.path_now = QLabel("â€”")
         self.path_now.setStyleSheet("color: #ccc;")
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
@@ -739,7 +1894,6 @@ class MainWindow(QMainWindow):
         right_v.addWidget(self.grid, 1)
 
         # --- LEFT panel: controls beside the file view ---
-        # (REPLACES the old `left_placeholder = QWidget()` section)
         left_panel = QWidget()
         left_v = QVBoxLayout(left_panel)
         left_v.setContentsMargins(6, 6, 6, 6)
@@ -761,13 +1915,42 @@ class MainWindow(QMainWindow):
         self.staging_view.setDragDropMode(QAbstractItemView.NoDragDrop)
         self.staging_view.setModel(self.staging_model)
 
-        # Header for the left panel
-        self.staging_hdr = QLabel("Staging — _incoming")
+        # Header row for the left panel (title + Globe toggle)
+        self.staging_hdr = QLabel("Staging â€” _incoming")
         self.staging_hdr.setStyleSheet("font-weight: 600; color: #bbb;")
 
+        self.globe_toggle_btn = QPushButton("Globe")
+        self.globe_toggle_btn.setCheckable(True)
+        self.globe_toggle_btn.setFocusPolicy(Qt.NoFocus)
+
+        # TEMPORARY: Debug button to test GPS cache
+        self.test_gps_btn = QPushButton("Test GPS")
+        self.test_gps_btn.setFocusPolicy(Qt.NoFocus)
+        self.test_gps_btn.clicked.connect(self.on_test_gps)
+
+        #Add GPS cache reference
+        self.gps_cache = None
+        self.gps_indexer_thread = None
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
+        header_row.addWidget(self.staging_hdr, 1)
+        header_row.addWidget(self.globe_toggle_btn)
+        header_row.addWidget(self.test_gps_btn)
+
+        # Stack: page 0 = staging thumbnails, page 1 = globe
+        self.left_stack = QStackedWidget()
+        self.left_stack.addWidget(self.staging_view)   # index 0
+
+        self.globe_widget = GlobeWidget()
+        self.left_stack.addWidget(self.globe_widget)   # index 1
+
         controls_row = QHBoxLayout()
-        left_v.addWidget(self.staging_hdr)
-        left_v.addWidget(self.staging_view, 1)
+
+        left_v.addLayout(header_row)
+        left_v.addWidget(self.left_stack, 1)
+
         self.upload_btn = QPushButton("Upload")
         self.upload_btn.setEnabled(False)  # enabled after a folder is chosen
         controls_row.setContentsMargins(0, 0, 0, 0)
@@ -775,12 +1958,11 @@ class MainWindow(QMainWindow):
 
         controls_row.addWidget(self.choose_btn)
         controls_row.addWidget(self.upload_btn)
-        controls_row.addWidget(self.path_label, 1)  # expands after Choose Folder
-        controls_row.addStretch()                   # pushes Run to the far right (next to splitter)
+        controls_row.addWidget(self.path_label, 1)
+        controls_row.addStretch()
         controls_row.addWidget(self.run_btn)
         self.upload_btn.clicked.connect(self.on_upload_clicked)
 
-        left_v.addStretch(1)  # keep the row at the top-left; rest stays empty
         left_v.addLayout(controls_row)
 
         # --- Splitter with left controls and right file view ---
@@ -810,6 +1992,9 @@ class MainWindow(QMainWindow):
         # ---- Signals ----
         self.choose_btn.clicked.connect(self.on_choose_folder)
         self.run_btn.clicked.connect(self.on_run_clicked)  # not wired yet
+
+        if hasattr(self, "globe_toggle_btn"):
+            self.globe_toggle_btn.toggled.connect(self.on_globe_toggled)
 
         # Keep track of the selected folder path
         self.selected_folder = None
@@ -847,11 +2032,11 @@ class MainWindow(QMainWindow):
             return
         first = self.model.index(0, 0, root)
         last  = self.model.index(rows - 1, 0, root)
-        # Tell the model the decoration may have changed → provider.icon() runs again
+        # Tell the model the decoration may have changed â†’ provider.icon() runs again
         self.model.dataChanged.emit(first, last, [Qt.DecorationRole, Qt.DisplayRole, Qt.SizeHintRole])
         # Nudge layout so the paint happens right away
         self.grid.doItemsLayout()
-        # Kick the thumbnail provider’s pending queue
+        # Kick the thumbnail providerâ€™s pending queue
         self._icon_provider._maybe_start_pending()
 
     def _touch_visible_icons(self):
@@ -885,14 +2070,14 @@ class MainWindow(QMainWindow):
             self._icon_provider.icon(fi)
 
     def resizeEvent(self, event):
+        """Keep button in top-right corner when widget resizes"""
         super().resizeEvent(event)
-        if self.loading and self.grid:
-            self.loading.setGeometry(self.grid.rect())
-        # keep the 55/45 ratio and update columns as window changes
-        self._schedule_layout()
-        root_idx = self.grid.rootIndex()
-        root_path = self.model.filePath(root_idx) if root_idx.isValid() else (self.selected_folder or "—")
-        self._set_current_path(root_path)
+        if hasattr(self, 'map_style_btn'):
+            # Position button 10px from top-right corner
+            btn_size = self.map_style_btn.size()
+            x = self.width() - btn_size.width() - 10
+            y = 10
+            self.map_style_btn.move(x, y)
     
     def eventFilter(self, obj, event):
         if obj is self.grid.viewport() and event.type() == QEvent.Resize:
@@ -905,66 +2090,64 @@ class MainWindow(QMainWindow):
             return
 
         self.selected_folder = folder
+
+        # Clean up old GPS thread
+        if hasattr(self, 'gps_indexer_thread') and self.gps_indexer_thread:
+            try:
+                self.gps_indexer_thread.intermediate_points.disconnect()
+                self.gps_indexer_thread.progress.disconnect()
+                self.gps_indexer_thread.finished_with_count.disconnect()
+                self.gps_indexer_thread.error.disconnect()
+            except Exception:
+                pass
+
+            self.gps_indexer_thread.stop()
+            self.gps_indexer_thread.quit()
+            self.gps_indexer_thread.wait(3000)
+            print(f"[GPS Switch] Stopped old thread after {folder}")
+
+        self.gps_indexer_thread = None
+
+        # Clear globe if visible
+        if hasattr(self, "globe_widget"):
+            print(f"[GPS Switch] Resetting globe for new library: {folder}")
+            self.globe_widget._has_been_rendered = False  # Force re-render for new library
+            if getattr(self, "globe_toggle_btn", None) and self.globe_toggle_btn.isChecked():
+                # If currently viewing globe, clear it
+                self.globe_widget.set_points([], use_clustering=False)
+
         self.path_label.setText(folder)
         self._nav_stack.clear()
         self._set_current_path(folder)
         self.path_label.setStyleSheet("")
         self.statusBar().showMessage("Folder selected.", 2000)
 
+        # ... rest of your existing code for staging setup ...
         incoming_root = os.path.join(self.selected_folder, "_incoming")
         os.makedirs(incoming_root, exist_ok=True)
-        incoming_idx = self.staging_model.setRootPath(incoming_root)
-        self.staging_view.setRootIndex(incoming_idx)
-        self.staging_hdr.setText("Staging — _incoming (no uploads yet)")
+        # ... (keep your existing staging code) ...
 
-        # Show overlay + disable view immediately
+        # Show loading overlay
         self.loading.setGeometry(self.grid.rect())
         self.loading.setVisible(True)
         self.grid.setEnabled(False)
-        QApplication.processEvents()  # let UI update right now
+        QApplication.processEvents()
 
         self._icon_provider.cancel_all_and_clear()   
-        self._pending_refresh.clear()  # NEW: Clear pending refresh on new folder
+        self._pending_refresh.clear()
 
-        # Defer the heavy work to the next event loop tick
         QTimer.singleShot(0, lambda: self._load_folder(folder))
         QTimer.singleShot(50, self._schedule_layout)
 
-        # Enable Run now that we have a target
         self.run_btn.setEnabled(True)
         self.upload_btn.setEnabled(True)
 
-        # --- Staging / resume handling ---
-        incoming_root = os.path.join(self.selected_folder, "_incoming")
-        os.makedirs(incoming_root, exist_ok=True)
+        # Initialize GPS cache
+        self.gps_cache = GPSCache(folder)
 
-        resume = self._scan_resume_state()
-        if resume and resume["total"] > 0 and resume["processed"] > 0:
-            # There is a session with partial progress -> show it directly
-            stg_idx = self.staging_model.setRootPath(resume["session_dir"])
-            self.staging_view.setRootIndex(stg_idx)
-            self.staging_hdr.setText(
-                f"Staging — {resume['session_name']} "
-                f"(resume: {resume['processed']}/{resume['total']} done, "
-                f"{resume['remaining']} remaining)"
-            )
-            self.statusBar().showMessage(
-                f"Found unfinished session: {resume['processed']} of {resume['total']} already processed.",
-                5000,
-            )
-        else:
-            # No unfinished session; show root incoming as empty staging
-            stg_idx = self.staging_model.setRootPath(incoming_root)
-            self.staging_view.setRootIndex(stg_idx)
-            self.staging_hdr.setText("Staging — _incoming (no uploads yet)")
-
-        # Prepare staging view to watch _incoming (empty until first upload)
-        incoming_root = os.path.join(self.selected_folder, "_incoming")
-        os.makedirs(incoming_root, exist_ok=True)
-        incoming_idx = self.staging_model.setRootPath(incoming_root)
-        self.staging_view.setRootIndex(incoming_idx)
-        self.staging_hdr.setText("Staging — _incoming (no session)")
-
+        # **KEY FIX**: Start background indexing immediately (don't wait for globe toggle)
+        self._start_background_gps_index()
+    
     def _load_folder(self, folder: str):
         # If the grid has no model yet (first time), attach it now
         if self.grid.model() is None:
@@ -1051,7 +2234,7 @@ class MainWindow(QMainWindow):
             self.choose_btn.setEnabled(False)
             self.run_btn.setEnabled(False)
             mode_text = "skipping duplicates" if dup_policy == "skip" else "copying duplicates as new files"
-            self.statusBar().showMessage(f"Running organizer… ({mode_text})")
+            self.statusBar().showMessage(f"Running organizerâ€¦ ({mode_text})")
 
             # Start worker thread
             self.thread = WorkerThread(self.selected_folder, dup_policy, parent=self)
@@ -1129,7 +2312,7 @@ class MainWindow(QMainWindow):
         # Make the LEFT (staging) panel show this session
         stg_idx = self.staging_model.setRootPath(session_dir)
         self.staging_view.setRootIndex(stg_idx)
-        self.staging_hdr.setText(f"Staging — {os.path.basename(session_dir)}")
+        self.staging_hdr.setText(f"Staging â€” {os.path.basename(session_dir)}")
 
         # Build a friendly status message
         if errors:
@@ -1145,6 +2328,10 @@ class MainWindow(QMainWindow):
             if rejected:
                 msg += f" (skipped {rejected} non-media/shortcut file(s))"
             self.statusBar().showMessage(msg, 5000)
+
+        # Library content changed; refresh globe if it's visible
+        if getattr(self, "globe_toggle_btn", None) and self.globe_toggle_btn.isChecked():
+            self.update_globe_for_library_cached()
 
     # Optional simple extension filter, if you want to enable later.
     def apply_filter(self):
@@ -1166,7 +2353,7 @@ class MainWindow(QMainWindow):
         # Thread has finished; clear our pointer so we don't touch a deleted object
         self.thread = None
 
-        self.statusBar().showMessage("Done ✅", 3000)
+        self.statusBar().showMessage("Done ✅ - Refreshing Map...", 3000)
         self.choose_btn.setEnabled(True)
         self.run_btn.setEnabled(True)
 
@@ -1175,7 +2362,13 @@ class MainWindow(QMainWindow):
             incoming_root = os.path.join(self.selected_folder, "_incoming")
             idx = self.staging_model.setRootPath(incoming_root)
             self.staging_view.setRootIndex(idx)
-            self.staging_hdr.setText("Staging — _incoming (empty)")
+            self.staging_hdr.setText("Staging : _incoming (empty)")
+
+            # === FIX START: TRIGGER RE-SCAN ===
+            # The files are moved, but the GPS database doesn't know about them yet.
+            # We restart the background indexer to find the new files and put them on the map.
+            print("[UI] Organization complete. Restarting GPS indexer to map new files.")
+            self._start_background_gps_index()
 
     def on_error(self, msg: str):
         # Thread will be torn down; clear pointer
@@ -1377,7 +2570,7 @@ class MainWindow(QMainWindow):
             self.grid.setFocus(Qt.OtherFocusReason)
 
     def _request_select_first(self):
-        # mark intent; we’ll satisfy when rows exist
+        # mark intent; weâ€™ll satisfy when rows exist
         self._want_select_first = True
         QTimer.singleShot(0, self._try_select_first)
 
@@ -1399,7 +2592,7 @@ class MainWindow(QMainWindow):
             self.grid.setFocus(Qt.OtherFocusReason)
             self._want_select_first = False   # satisfied
         else:
-            # try again shortly—rows may not be in yet
+            # try again shortlyâ€”rows may not be in yet
             QTimer.singleShot(30, self._try_select_first)
 
     # -- helpers to show/hide the loading overlay --
@@ -1456,18 +2649,23 @@ class MainWindow(QMainWindow):
             return
 
         rows = self.model.rowCount(root)
-        CHUNK = 200  # keep UI responsive on very large folders
+        if rows <= 0:
+            return
+
+        # Only prewarm the first 800 items, the rest will be loaded lazily on scroll
+        MAX_PREWARM = 800
+        rows_to_touch = min(rows, MAX_PREWARM)
+        CHUNK = 200  # still in small slices
 
         def kick(start=0):
-            if start >= rows:
+            if start >= rows_to_touch:
                 return
-            end = min(start + CHUNK, rows)
+            end = min(start + CHUNK, rows_to_touch)
             for r in range(start, end):
                 idx = self.model.index(r, 0, root)
                 fi = self.model.fileInfo(idx)
                 if fi.isDir():
                     continue
-                # This is the same path your view uses: asking for an icon schedules/queues a thumb.
                 self._icon_provider.icon(fi)
             QTimer.singleShot(0, lambda: kick(end))
 
@@ -1515,7 +2713,7 @@ class MainWindow(QMainWindow):
                     img = reader.read()
                     if not img.isNull():
                         return True
-                # Qt failed or gave null → try Pillow
+                # Qt failed or gave null â†’ try Pillow
                 try:
                     im = Image.open(path)
                     im.verify()  # raises if not a real image
@@ -1539,6 +2737,252 @@ class MainWindow(QMainWindow):
 
         # Fallback: be conservative
         return False
+    
+    def on_globe_toggled(self, checked: bool):
+        if checked:
+            self.globe_toggle_btn.setText("Staging")
+            self.left_stack.setCurrentWidget(self.globe_widget)
+
+            # Initialize cache if needed
+            if not self.gps_cache and self.selected_folder:
+                self.gps_cache = GPSCache(self.selected_folder)
+
+            # **KEY IMPROVEMENT**: Only render globe HTML on FIRST view
+            if not hasattr(self.globe_widget, '_has_been_rendered') or not self.globe_widget._has_been_rendered:
+                print("[Globe Toggle] First time viewing globe - rendering HTML")
+
+                # Load whatever we have in cache immediately
+                cached_points = self.gps_cache.get_all_points(limit=50000) if self.gps_cache else []
+                print(f"[Globe Toggle] Loading {len(cached_points)} cached points")
+
+                if cached_points:
+                    self.globe_widget.set_points(cached_points, use_clustering=len(cached_points) > 100)
+                    self.statusBar().showMessage(f"Map: {len(cached_points)} locations (updating...)", 3000)
+                else:
+                    # Show empty globe but indicate scanning is in progress
+                    self.globe_widget.set_points([], use_clustering=False)
+                    self.statusBar().showMessage("Scanning for GPS data...", 3000)
+
+                # Mark as rendered so we don't do it again
+                self.globe_widget._has_been_rendered = True
+            else:
+                # FIX: Always refresh data when switching tabs, in case background indexer added points
+                print("[Globe Toggle] Globe already rendered - refreshing view with latest DB data")
+                if self.gps_cache:
+                    # 1. Get the latest points from the DB (including the 14 new ones)
+                    latest_points = self.gps_cache.get_all_points(limit=50000)
+                    
+                    # 2. Send them to the globe
+                    # (Your set_points function is smart—it won't reload the page, just update the dots)
+                    self.globe_widget.set_points(latest_points, use_clustering=len(latest_points) > 100)
+                    
+                    self.statusBar().showMessage(f"Map: {len(latest_points)} locations", 2000)
+
+            # Background thread continues updating regardless of view
+        else:
+            self.globe_toggle_btn.setText("Globe")
+            self.left_stack.setCurrentWidget(self.staging_view)
+
+    def update_globe_for_library(self):
+        """
+        Backwards-compatible wrapper: always go through GPSCache.
+        """
+        if not hasattr(self, "globe_widget") or self.globe_widget is None:
+            return
+
+        folder = getattr(self, "selected_folder", None)
+        if not folder or not os.path.isdir(folder):
+            self.globe_widget.set_points([])
+            return
+
+        if not self.gps_cache:
+            self.gps_cache = GPSCache(folder)
+
+        self.update_globe_for_library_cached()
+
+    def update_globe_for_library_cached(self):
+        """Load GPS with progressive strategy"""
+        if not self.gps_cache or not hasattr(self, "globe_widget"):
+            return
+
+        print("[DEBUG] update_globe_for_library_cached called")
+
+        # Strategy 1: Show cached data immediately (instant)
+        cached_points = self.gps_cache.get_all_points(limit=10000)
+
+        if cached_points:
+            print(f"[DEBUG] Showing {len(cached_points)} cached points immediately")
+            self.globe_widget.set_points(cached_points, use_clustering=len(cached_points) > 100)
+            self.statusBar().showMessage(f"Map: {len(cached_points)} locations (cached)", 3000)
+        else:
+            # Strategy 2: No cache - do a quick scan of visible folders first
+            print("[DEBUG] No cache - doing quick scan of top folders")
+            quick_points = []
+
+            # Scan first few country folders
+            try:
+                for item in os.listdir(self.selected_folder)[:5]:  # first 5 folders
+                    folder_path = os.path.join(self.selected_folder, item)
+                    if os.path.isdir(folder_path) and not item.startswith("_"):
+                        folder_points = self.gps_cache.quick_scan_folder(folder_path, max_files=20)
+                        quick_points.extend(folder_points)
+
+                        if len(quick_points) >= 50:  # Got enough for initial display
+                            break
+            except Exception as e:
+                print(f"[DEBUG] Quick scan error: {e}")
+
+            if quick_points:
+                print(f"[DEBUG] Quick scan found {len(quick_points)} points")
+                self.globe_widget.set_points(quick_points, use_clustering=False)
+                self.statusBar().showMessage(f"Map: {len(quick_points)} locations (scanning...)", 3000)
+
+        # Strategy 3: Start full background scan (will update progressively)
+        self._start_background_gps_index()
+
+    def on_test_gps(self):
+        """Debug function to test GPS cache"""
+        if not self.selected_folder:
+            print("[TEST] No folder selected")
+            QMessageBox.information(self, "Test GPS", "Please select a folder first")
+            return
+        print("\n" + "="*60)
+        print("[TEST] Starting GPS cache test")
+        print("="*60)
+        # Check if cache exists
+        if not self.gps_cache:
+            print("[TEST] Creating GPS cache...")
+            self.gps_cache = GPSCache(self.selected_folder)
+        # Check current database contents
+        print("\n[TEST] Current database contents:")
+        conn = sqlite3.connect(self.gps_cache.db_path)
+        cursor = conn.execute("SELECT COUNT(*) FROM gps_points")
+        count = cursor.fetchone()[0]
+        print(f"[TEST] Database has {count} entries")
+        if count > 0:
+            cursor = conn.execute("SELECT filepath, lat, lon, country FROM gps_points LIMIT 5")
+            print("[TEST] Sample entries:")
+            for row in cursor:
+                print(f"  - {os.path.basename(row[0])}: ({row[1]}, {row[2]}) {row[3]}")
+        conn.close()
+        # Try to get points
+        print("\n[TEST] Testing get_all_points():")
+        all_points = self.gps_cache.get_all_points(limit=10)
+        print(f"[TEST] Got {len(all_points)} points")
+        for p in all_points[:3]:
+            print(f"  - {p}")
+        print("\n[TEST] Testing get_clustered_points():")
+        clustered = self.gps_cache.get_clustered_points(zoom_level=5)
+        print(f"[TEST] Got {len(clustered)} clusters")
+        for c in clustered[:3]:
+            print(f"  - {c}")
+        # Force a manual scan
+        print("\n[TEST] Starting manual folder scan...")
+        #processed = self.gps_cache.update_from_folder(self.selected_folder)
+        print("Use the 'Globe' tab to trigger background scanning")
+        print(f"[TEST] Scan complete: {processed} files processed")
+        # Check again
+        print("\n[TEST] After scan - database contents:")
+        conn = sqlite3.connect(self.gps_cache.db_path)
+        cursor = conn.execute("SELECT COUNT(*) FROM gps_points")
+        count = cursor.fetchone()[0]
+        print(f"[TEST] Database now has {count} entries")
+        conn.close()
+        # Try to display on globe
+        if hasattr(self, "globe_widget"):
+            print("\n[TEST] Updating globe...")
+            points = self.gps_cache.get_all_points(limit=1000)
+            print(f"[TEST] Sending {len(points)} points to globe")
+            self.globe_widget.set_points(points, use_clustering=False)
+        print("\n" + "="*60)
+        print("[TEST] Test complete - check console output above")
+        print("="*60 + "\n")
+        QMessageBox.information(
+            self, 
+            "GPS Test Complete", 
+            f"Found {count} GPS points in database.\n"
+            f"Check console for detailed output."
+        )
+
+    def _on_gps_batch_found(self, new_points: list):
+        """Progressive update - adds points without camera reset"""
+        if not new_points:
+            return
+
+        print(f"[GPS Update] Batch: +{len(new_points)} points")
+
+        is_globe_visible = (
+            hasattr(self, "left_stack")
+            and hasattr(self, "globe_widget") 
+            and self.left_stack.currentWidget() == self.globe_widget
+            and self.globe_widget.view is not None
+        )
+
+        if not is_globe_visible:
+            print("[GPS Update] Globe not visible - caching for later")
+            self.statusBar().showMessage(f"GPS scanning in background...", 1000)
+            return
+
+        # **IMPROVED**: Use incremental update if already loaded
+        if hasattr(self.globe_widget, '_is_loaded') and self.globe_widget._is_loaded:
+            print(f"[GPS Update] Adding {len(new_points)} points incrementally (no camera reset)")
+            self.globe_widget.add_batch_js(new_points)
+            all_points = self.gps_cache.get_all_points(limit=50000)
+            self.statusBar().showMessage(f"Map: {len(all_points)} locations", 1500)
+        else:
+            # First load: full render with all cached points
+            all_points = self.gps_cache.get_all_points(limit=50000)
+            print(f"[GPS Update] Initial render with {len(all_points)} points")
+            self.globe_widget.set_points(all_points, use_clustering=len(all_points) > 100)
+
+    def _start_background_gps_index(self):
+        """Start background thread with progressive updates"""
+        if self.gps_indexer_thread and self.gps_indexer_thread.isRunning():
+            print("[DEBUG] GPS indexer already running, skipping")
+            return
+
+        if not self.selected_folder:
+            print("[DEBUG] No selected folder, cannot start GPS indexer")
+            return
+
+        print(f"[DEBUG] Starting progressive GPS indexer for: {self.selected_folder}")
+
+        self.gps_indexer_thread = GPSIndexerThread(self.selected_folder, self)
+
+        # **KEY FIX**: Connect signals that will work regardless of current view
+        self.gps_indexer_thread.intermediate_points.connect(self._on_gps_batch_found)
+        self.gps_indexer_thread.progress.connect(self._on_gps_index_progress)
+        self.gps_indexer_thread.finished_with_count.connect(self._on_gps_index_done)
+        self.gps_indexer_thread.error.connect(lambda e: print(f"GPS indexing error: {e}"))
+
+        self.gps_indexer_thread.start()
+
+    def _on_gps_index_progress(self, count):
+        if count % 100 == 0:  # Report every 100 files
+            self.statusBar().showMessage(f"Scanning GPS data: {count} files processed...", 1000)
+            print(f"[DEBUG] GPS index progress: {count}")
+
+    def _on_gps_index_done(self, count):
+        """Final update when indexing completes"""
+        print(f"[DEBUG] GPS indexing complete: {count} files total")
+
+        # **KEY FIX**: Only do final refresh if globe is visible
+        if hasattr(self, "globe_toggle_btn") and self.globe_toggle_btn.isChecked():
+            points = self.gps_cache.get_all_points(limit=50000) if self.gps_cache else []
+            print(f"[DEBUG] Final globe update: {len(points)} points")
+
+            # Force full re-render on completion (cleanup any issues)
+            self.globe_widget.set_points(points, use_clustering=len(points) > 100)
+
+        self.statusBar().showMessage(f"âœ… GPS scan complete: {count} locations indexed", 5000)   
+
+    def _collect_gps_points(self, folder: str):
+        """
+        Walk the entire library tree under `folder`, skipping _incoming etc,
+        and use organizer.run_exiftool_tree + organizer.extract_latlon
+        to collect one point per media file with GPS.
+        """
+        return collect_gps_points(folder)
 
 def main():
     app = QApplication(sys.argv)
